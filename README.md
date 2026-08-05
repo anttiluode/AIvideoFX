@@ -1,5 +1,7 @@
 # AI Video FX — Layered PhaseRail build
 
+Video about it: https://youtu.be/Hep1g3-IX4w
+
 ![pic](pic.png)
 
 This version adds the missing **two-world mode** to the existing AI Video FX
