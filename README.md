@@ -17,7 +17,7 @@ The old depth, segmentation, whole-frame AI Dream and procedural effects remain.
 
 ```bat
 python3.13 -m pip install -r requirements.txt
-python3.13 ai_video_fx.py --preset "Antti Layered Dream"
+python3.13 ai_video_fx.py 
 ```
 
 The first use downloads the selected Hugging Face models. CUDA is strongly
