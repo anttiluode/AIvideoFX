@@ -1,9 +1,12 @@
+import sys
+import types
 import unittest
 
 import cv2
 import numpy as np
 
 from causal_refresh import CausalRefreshController, normalized_structure_mismatch
+from fx_core import FXContext, MapStore
 
 
 def bars(horizontal=False, size=96):
@@ -57,6 +60,61 @@ class CausalRefreshTests(unittest.TestCase):
         self.assertFalse(r.triggered)
         r = ctrl.update(a, b, keyframe_age=2.5, phase_confidence=0.0, motion=3.5, max_motion=3.5)
         self.assertTrue(r.triggered)
+
+    def test_effect_runs_with_published_person_and_background(self):
+        # Exercise the actual CausalPhaseRailLayer plumbing without requiring
+        # torch/CUDA in CI. A tiny fake rail has the same public contract.
+        class FakeRail:
+            def __init__(self, size=128, device="cpu"):
+                self.size = size
+                self.target = None
+
+            def set_target(self, target):
+                self.target = target.copy()
+
+            def process(self, source, **kwargs):
+                out = self.target.copy() if self.target is not None else source.copy()
+                coherence = np.ones(source.shape[:2], np.float32)
+                metrics = {"confidence": 1.0, "motion": 0.0, "coherence": 1.0, "removed": 0.0}
+                return out.astype(np.float32), coherence, metrics
+
+        fake = types.ModuleType("fx_phase_rail")
+        fake.LayerPhaseRail = FakeRail
+        old = sys.modules.get("fx_phase_rail")
+        sys.modules["fx_phase_rail"] = fake
+        try:
+            from fx_causal_refresh import CausalPhaseRailLayer
+
+            h, w = 96, 128
+            store = MapStore()
+            mask = np.ones((h, w), np.float32)
+            person = np.zeros((h, w, 3), np.float32)
+            person[..., 1] = 0.9
+            background = np.zeros((h, w, 3), np.float32)
+            background[..., 0] = 0.8
+            store.put("mask", mask)
+            store.put("person_style", person)
+            store.put("background_style", background)
+
+            effect = CausalPhaseRailLayer({
+                "device": "cpu",
+                "rail_size": "64",
+                "show_refresh": True,
+                "auto_refresh": True,
+                "refresh_threshold": 10.0,
+            })
+            frame = np.zeros((h, w, 3), np.float32)
+            ctx = FXContext(store, 1.0, 1, (h, w))
+            out = effect.apply(frame, ctx)
+            self.assertEqual(out.shape, frame.shape)
+            self.assertEqual(out.dtype, np.float32)
+            self.assertTrue(np.isfinite(out).all())
+            self.assertGreater(float(out.mean()), 0.01)
+        finally:
+            if old is None:
+                sys.modules.pop("fx_phase_rail", None)
+            else:
+                sys.modules["fx_phase_rail"] = old
 
 
 if __name__ == "__main__":
