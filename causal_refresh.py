@@ -1,19 +1,26 @@
-"""Cheap causal-refresh criterion for the Layered PhaseRail video path.
+"""Cheap baseline-relative causal-refresh criterion for Layered PhaseRail.
 
 The expensive person image is generated occasionally and transported cheaply by
-PhaseRail between keyframes.  This module answers one narrow control question:
+PhaseRail between keyframes.  This module asks one narrow control question:
 
-    has the transported appearance become a poor enough explanation of the
-    current live structure that buying another diffusion keyframe is justified?
+    has the transported appearance become *worse than its own normal resting
+    mismatch* with the live person, enough to justify buying another diffusion
+    keyframe?
 
-It deliberately does *not* compare raw RGB. A prompted marble/robot/etc person
-should not be penalised merely for having different colour from the webcam.
-The primary residual is a contrast-normalised blurred edge/structure map inside
-the current ownership mask. PhaseRail confidence and motion saturation are
-small secondary terms.
+That distinction matters for stylised video.  A marble/robot/etc keyframe has a
+permanent non-zero mismatch with webcam appearance even when transport is
+working perfectly.  Accumulating the absolute residual therefore creates a
+positive floor and eventually refreshes forever.
 
-This is a heuristic controller. It is testable and tuneable; it is not a proof
-of optimality or a calibrated probability of failure.
+The primary instantaneous residual is still a contrast-normalised blurred
+edge/structure mismatch inside the person ownership mask, with smaller terms for
+PhaseRail confidence and motion saturation.  The controller now calibrates a
+per-keyframe baseline and runs a one-sided, leaky CUSUM-like change detector on
+excess above that baseline.
+
+This is a heuristic controller, not a calibrated probability or proof of
+optimality.  Its purpose is testable: stay quiet on a stable non-zero style gap,
+but fire when the mismatch shifts upward after calibration.
 """
 from __future__ import annotations
 
@@ -85,25 +92,52 @@ class RefreshReading:
     confidence_penalty: float
     motion_penalty: float
     instant: float
+    baseline: float
+    excess: float
     evidence: float
     threshold: float
+    calibrated: bool
     triggered: bool
 
 
 class CausalRefreshController:
-    """Leaky accumulated mismatch with an explicit keyframe-age gate."""
+    """Per-keyframe baseline + one-sided leaky change detector.
+
+    Calibration deliberately happens after every fresh generated keyframe.  A
+    short warm-up estimates the normal style/transport floor with a median.  The
+    detector then accumulates only positive change above::
+
+        baseline * (1 + baseline_margin)
+
+    using::
+
+        evidence = max(0, decay * evidence + excess)
+
+    A constant non-zero mismatch therefore settles near zero evidence instead of
+    mathematically guaranteeing a refresh.  While the detector is quiet, the
+    baseline follows very slowly so gradual lighting/style drift can be treated
+    as nuisance rather than as an event.
+    """
 
     def __init__(
         self,
         *,
         decay: float = 0.94,
-        threshold: float = 0.80,
+        threshold: float = 0.30,
         min_keyframe_age: float = 0.80,
+        baseline_alpha: float = 0.02,
+        baseline_margin: float = 0.10,
+        warmup_samples: int = 12,
     ) -> None:
         self.decay = float(decay)
         self.threshold = float(threshold)
         self.min_keyframe_age = float(min_keyframe_age)
+        self.baseline_alpha = float(baseline_alpha)
+        self.baseline_margin = float(baseline_margin)
+        self.warmup_samples = max(3, int(warmup_samples))
         self.evidence = 0.0
+        self.baseline: float | None = None
+        self._warmup: list[float] = []
         self.last: RefreshReading | None = None
 
     def configure(self, *, decay: float, threshold: float, min_keyframe_age: float) -> None:
@@ -113,7 +147,31 @@ class CausalRefreshController:
 
     def reset(self) -> None:
         self.evidence = 0.0
+        self.baseline = None
+        self._warmup = []
         self.last = None
+
+    def _change_update(self, instant: float) -> tuple[float, float, bool]:
+        """Return baseline, signed excess, calibrated flag for one sample."""
+        if len(self._warmup) < self.warmup_samples:
+            self._warmup.append(float(instant))
+            self.baseline = float(np.median(self._warmup))
+            self.evidence = 0.0
+            return float(self.baseline), 0.0, False
+
+        assert self.baseline is not None
+        baseline_before = float(self.baseline)
+        excess = float(instant - baseline_before * (1.0 + self.baseline_margin))
+        self.evidence = max(0.0, self.decay * self.evidence + excess)
+
+        # Adapt the nuisance floor only while the detector is convincingly
+        # quiet.  Once a change begins accumulating, freeze the reference so it
+        # cannot chase away the event it is supposed to detect.
+        if self.evidence < 0.20 * self.threshold:
+            a = float(np.clip(self.baseline_alpha, 0.0, 1.0))
+            self.baseline = (1.0 - a) * baseline_before + a * float(instant)
+
+        return float(self.baseline), excess, True
 
     def update(
         self,
@@ -138,11 +196,10 @@ class CausalRefreshController:
             0.0, 1.0,
         ))
 
-        # A leaky sum, not a monotone scientific D_T^2. Quiet frames forget old
-        # trouble; persistent mismatch eventually crosses the spend threshold.
-        self.evidence = self.decay * self.evidence + instant * instant
+        baseline, excess, calibrated = self._change_update(instant)
         triggered = bool(
-            float(keyframe_age) >= self.min_keyframe_age
+            calibrated
+            and float(keyframe_age) >= self.min_keyframe_age
             and self.evidence >= self.threshold
         )
         self.last = RefreshReading(
@@ -150,8 +207,11 @@ class CausalRefreshController:
             confidence_penalty=confidence_penalty,
             motion_penalty=motion_penalty,
             instant=instant,
+            baseline=baseline,
+            excess=excess,
             evidence=float(self.evidence),
             threshold=float(self.threshold),
+            calibrated=calibrated,
             triggered=triggered,
         )
         return self.last
