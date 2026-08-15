@@ -1,14 +1,14 @@
 """Causal-refresh sibling for the existing Antti Layered PhaseRail effect.
 
-Importing this module registers one extra effect and preset in fx_core without
-changing the shipped AnttisDeepfakeLayer.  Use via::
+Importing this module registers one extra effect/preset without changing the
+shipped AnttisDeepfakeLayer.  The ordinary PhaseRail still carries a frozen
+generated person between expensive diffusion calls.
 
-    python ai_video_fx_causal.py
-
-The effect carries the last generated person with PhaseRail.  A cheap,
-style-tolerant structure residual is measured continuously.  Each new generated
-keyframe first establishes its own normal mismatch floor; only a later upward
-change from that floor accumulates toward another expensive refresh.
+The refresh receiver is deliberately *not* live-vs-generated appearance.  When
+a fresh generated person keyframe is accepted, this effect snapshots the live
+actor geometry at that same moment.  Later frames are compared with that fixed
+live reference.  A persistent rise in keyframe-relative geometry drift asks the
+existing diffusion worker for another person keyframe.
 """
 from __future__ import annotations
 
@@ -31,15 +31,15 @@ from fx_core import (
 class CausalPhaseRailLayer(AnttisDeepfakeLayer):
     name = "Antti Causal Refresh"
     blurb = (
-        "The normal Layered PhaseRail plus a baseline-relative automatic "
-        "keyframe-spend rule. It learns the resting style/transport mismatch of "
-        "each generated person, then refreshes only when mismatch rises above "
-        "that floor persistently. The old keyframe remains visible while the "
-        "replacement is generating."
+        "Layered PhaseRail with a keyframe-relative automatic spend rule. "
+        "Each generated person is anchored to the live geometry present when "
+        "that keyframe is accepted. The old generated appearance is transported "
+        "until live geometry persistently leaves that anchor, then diffusion is "
+        "asked for a replacement."
     )
     params = AnttisDeepfakeLayer.params + [
         Param("auto_refresh", "Auto refresh", "bool", True),
-        Param("refresh_threshold", "Change threshold", "float", 0.30, 0.02, 2.0),
+        Param("refresh_threshold", "Geometry-change threshold", "float", 0.20, 0.02, 2.0),
         Param("refresh_decay", "Change memory", "float", 0.94, 0.0, 0.995),
         Param("refresh_min_age", "Min key age (s)", "float", 0.80, 0.0, 10.0),
         Param("show_refresh", "Show refresh meter", "bool", True),
@@ -66,13 +66,11 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         if reading is None:
             return out
 
-        # OpenCV 5's text renderer requires an 8-bit image. AIvideoFX's effect
-        # bus is float32 [0,1], so draw the HUD on a temporary uint8 image and
-        # convert back.
+        # OpenCV 5's text renderer requires uint8; the effect bus is float32.
         hud = np.clip(out * 255.0, 0, 255).astype(np.uint8)
         h, w = hud.shape[:2]
         x0, y0 = 12, max(8, h - 34)
-        width = min(330, max(80, w - 24))
+        width = min(350, max(80, w - 24))
         height = 10
         ratio = float(np.clip(reading.evidence / max(1e-6, reading.threshold), 0.0, 1.0))
         cv2.rectangle(hud, (x0, y0), (x0 + width, y0 + height), (13, 13, 13), -1)
@@ -85,14 +83,14 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         else:
             state = "armed"
         label = (
-            f"causal {reading.evidence:.2f}/{reading.threshold:.2f} "
-            f"raw {reading.instant:.2f} base {reading.baseline:.2f} "
+            f"refresh {reading.evidence:.2f}/{reading.threshold:.2f} "
+            f"geom {reading.structural:.2f} base {reading.baseline:.2f} "
             f"d {reading.excess:+.2f} {state} n={count}"
         )
         cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.40, (5, 5, 5), 3, cv2.LINE_AA)
+                    0.38, (5, 5, 5), 3, cv2.LINE_AA)
         cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.40, (255, 255, 255), 1, cv2.LINE_AA)
+                    0.38, (255, 255, 255), 1, cv2.LINE_AA)
         return hud.astype(np.float32) * np.float32(1.0 / 255.0)
 
     def apply(self, img, ctx):
@@ -111,8 +109,6 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         held = st.get("held_person_ai")
         held_stamp = float(st.get("held_person_stamp", -1.0))
         if pending and live_person is not None and live_stamp != held_stamp:
-            # A genuinely new keyframe arrived.  Reset so this keyframe learns
-            # its own resting mismatch floor before it can trigger again.
             pending = False
             st["refresh_pending"] = False
             st["held_person_ai"] = None
@@ -159,6 +155,7 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
                     held_person_ai=None,
                     held_person_stamp=-1.0,
                     refresh_count=0,
+                    refresh_reference=None,
                 )
                 pending = False
                 self._controller(st).reset()
@@ -171,13 +168,15 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         target_small, _ = self._letterbox(target_owned, size)
         mask_small, _ = self._letterbox(m, size, fill=0.0)
 
-        # A held keyframe keeps its original stamp while the worker slot is
-        # empty. A new live publication gets a new store stamp and reanchors.
+        # The key point: accept generated style and live geometry together.
+        # PhaseRail's new target is defined relative to *this* source frame, so
+        # this is the natural zero of geometry age for the generated keyframe.
         target_stamp = live_stamp if live_person is not None else held_stamp
         if target_stamp != st.get("person_stamp"):
             rail.set_target(target_small)
             st["person_stamp"] = target_stamp
             if live_person is not None:
+                st["refresh_reference"] = source_small.copy()
                 self._controller(st).reset()
 
         try:
@@ -201,10 +200,16 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
 
         reading = st.get("refresh_reading")
         if bool(self.p("auto_refresh")) and person_ai is not None and not pending:
+            reference = st.get("refresh_reference")
+            if reference is None or reference.shape != source_small.shape:
+                reference = source_small.copy()
+                st["refresh_reference"] = reference
+                self._controller(st).reset()
+
             ctrl = self._controller(st)
             reading = ctrl.update(
                 source_small,
-                carried_small,
+                reference,
                 mask=mask_small,
                 phase_confidence=float(metrics.get("confidence", 1.0)),
                 motion=float(metrics.get("motion", 0.0)),
@@ -213,9 +218,9 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
             )
             st["refresh_reading"] = reading
             if reading.triggered and live_person is not None:
-                # Hold what is currently visible, then clear only the worker's
-                # publication slot. DiffusionWorker._due() sees the missing map
-                # and buys a replacement keyframe using the current camera frame.
+                # Hold the visible old keyframe, then clear only the worker's
+                # publication slot. DiffusionWorker sees the missing map and
+                # generates a replacement from the current camera stream.
                 st["held_person_ai"] = live_person.copy()
                 st["held_person_stamp"] = live_stamp
                 st["refresh_pending"] = True
@@ -269,7 +274,7 @@ def register() -> None:
                 "mask_expand": 2,
                 "mask_feather": 4.0,
                 "auto_refresh": True,
-                "refresh_threshold": 0.30,
+                "refresh_threshold": 0.20,
                 "refresh_decay": 0.94,
                 "refresh_min_age": 0.80,
                 "show_refresh": True,
