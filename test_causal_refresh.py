@@ -18,6 +18,22 @@ def bars(horizontal=False, size=96):
     return cv2.GaussianBlur(img, (0, 0), 0.8)
 
 
+class FakeRail:
+    """Tiny PhaseRail contract for effect integration tests."""
+    def __init__(self, size=128, device="cpu"):
+        self.size = size
+        self.target = None
+
+    def set_target(self, target):
+        self.target = target.copy()
+
+    def process(self, source, **kwargs):
+        out = self.target.copy() if self.target is not None else source.copy()
+        coherence = np.ones(source.shape[:2], np.float32)
+        metrics = {"confidence": 1.0, "motion": 0.0, "coherence": 1.0, "removed": 0.0}
+        return out.astype(np.float32), coherence, metrics
+
+
 class CausalRefreshTests(unittest.TestCase):
     def test_identical_structure_is_dark(self):
         a = bars(False)
@@ -37,10 +53,10 @@ class CausalRefreshTests(unittest.TestCase):
         self.assertGreater(normalized_structure_mismatch(a, b, m), 0.05)
 
     def test_constant_nonzero_floor_does_not_eventually_trigger(self):
-        """The old absolute accumulator failed this by construction."""
-        a = bars(False)
-        b = bars(True)
-        m = np.ones(a.shape[:2], np.float32)
+        """A fixed reference mismatch is nuisance after calibration, not a clock."""
+        reference = bars(False)
+        current = bars(True)
+        m = np.ones(reference.shape[:2], np.float32)
         ctrl = CausalRefreshController(
             decay=0.95, threshold=0.08, min_keyframe_age=0.0,
             warmup_samples=8,
@@ -48,7 +64,7 @@ class CausalRefreshTests(unittest.TestCase):
         readings = []
         for _ in range(160):
             readings.append(ctrl.update(
-                a, b, mask=m, phase_confidence=0.65,
+                current, reference, mask=m, phase_confidence=0.65,
                 motion=0.3, max_motion=3.5, keyframe_age=30.0,
             ))
         self.assertTrue(readings[-1].calibrated)
@@ -56,106 +72,98 @@ class CausalRefreshTests(unittest.TestCase):
         self.assertFalse(any(r.triggered for r in readings))
         self.assertLess(readings[-1].evidence, 0.01)
 
-    def test_later_structural_shift_triggers_relative_detector(self):
-        a = bars(False)
-        b = bars(True)
-        m = np.ones(a.shape[:2], np.float32)
+    def test_later_geometry_departure_triggers(self):
+        reference = bars(False)
+        moved = bars(True)
+        m = np.ones(reference.shape[:2], np.float32)
         ctrl = CausalRefreshController(
             decay=0.95, threshold=0.08, min_keyframe_age=0.0,
             warmup_samples=8,
         )
 
-        # Learn a non-zero nuisance floor first. Lowish confidence simulates a
-        # real styled transport path whose raw score never reaches zero.
+        # Stay near the accepted keyframe pose first.
         for _ in range(20):
             r = ctrl.update(
-                a, a, mask=m, phase_confidence=0.55,
-                motion=0.2, max_motion=3.5, keyframe_age=10.0,
+                reference, reference, mask=m, phase_confidence=0.65,
+                motion=0.1, max_motion=3.5, keyframe_age=10.0,
             )
             self.assertFalse(r.triggered)
         learned = r.baseline
-        self.assertGreater(learned, 0.0)
 
         triggered = False
         for _ in range(40):
             r = ctrl.update(
-                a, b, mask=m, phase_confidence=0.55,
+                moved, reference, mask=m, phase_confidence=0.65,
                 motion=0.2, max_motion=3.5, keyframe_age=10.0,
             )
             if r.triggered:
                 triggered = True
                 break
         self.assertTrue(triggered)
+        self.assertGreater(r.structural, 0.05)
         self.assertGreater(r.instant, learned)
         self.assertGreater(r.excess, 0.0)
 
     def test_keyframe_age_gate_blocks_early_refresh(self):
-        a = bars(False)
-        b = bars(True)
-        m = np.ones(a.shape[:2], np.float32)
+        reference = bars(False)
+        moved = bars(True)
+        m = np.ones(reference.shape[:2], np.float32)
         ctrl = CausalRefreshController(
             decay=0.95, threshold=0.02, min_keyframe_age=2.0,
             warmup_samples=6,
         )
         for _ in range(10):
             ctrl.update(
-                a, a, mask=m, phase_confidence=0.6,
+                reference, reference, mask=m, phase_confidence=0.8,
                 motion=0.0, max_motion=3.5, keyframe_age=0.5,
             )
 
-        # Build a large change score, but the young-keyframe gate must block it.
         r = None
         for _ in range(20):
             r = ctrl.update(
-                a, b, mask=m, phase_confidence=0.0,
-                motion=3.5, max_motion=3.5, keyframe_age=0.5,
+                moved, reference, mask=m, phase_confidence=0.8,
+                motion=1.0, max_motion=3.5, keyframe_age=0.5,
             )
         self.assertIsNotNone(r)
         self.assertGreater(r.evidence, r.threshold)
         self.assertFalse(r.triggered)
 
         r = ctrl.update(
-            a, b, mask=m, phase_confidence=0.0,
-            motion=3.5, max_motion=3.5, keyframe_age=2.5,
+            moved, reference, mask=m, phase_confidence=0.8,
+            motion=1.0, max_motion=3.5, keyframe_age=2.5,
         )
         self.assertTrue(r.triggered)
 
     def test_reset_for_new_keyframe_recalibrates(self):
         a = bars(False)
-        b = bars(True)
         ctrl = CausalRefreshController(warmup_samples=5)
         for _ in range(8):
-            r = ctrl.update(a, b, keyframe_age=10.0)
+            r = ctrl.update(a, a, keyframe_age=10.0, phase_confidence=0.7)
         self.assertTrue(r.calibrated)
         self.assertIsNotNone(ctrl.baseline)
         ctrl.reset()
         self.assertIsNone(ctrl.baseline)
         self.assertEqual(ctrl.evidence, 0.0)
-        r = ctrl.update(a, b, keyframe_age=10.0)
+        r = ctrl.update(a, a, keyframe_age=10.0, phase_confidence=0.7)
         self.assertFalse(r.calibrated)
         self.assertFalse(r.triggered)
 
-    def test_effect_runs_with_published_person_and_background(self):
-        # Exercise the actual CausalPhaseRailLayer plumbing without requiring
-        # torch/CUDA in CI. A tiny fake rail has the same public contract.
-        class FakeRail:
-            def __init__(self, size=128, device="cpu"):
-                self.size = size
-                self.target = None
-
-            def set_target(self, target):
-                self.target = target.copy()
-
-            def process(self, source, **kwargs):
-                out = self.target.copy() if self.target is not None else source.copy()
-                coherence = np.ones(source.shape[:2], np.float32)
-                metrics = {"confidence": 1.0, "motion": 0.0, "coherence": 1.0, "removed": 0.0}
-                return out.astype(np.float32), coherence, metrics
-
+    def _with_fake_rail(self):
         fake = types.ModuleType("fx_phase_rail")
         fake.LayerPhaseRail = FakeRail
         old = sys.modules.get("fx_phase_rail")
         sys.modules["fx_phase_rail"] = fake
+        return old
+
+    @staticmethod
+    def _restore_fake_rail(old):
+        if old is None:
+            sys.modules.pop("fx_phase_rail", None)
+        else:
+            sys.modules["fx_phase_rail"] = old
+
+    def test_effect_runs_and_captures_live_keyframe_reference(self):
+        old = self._with_fake_rail()
         try:
             from fx_causal_refresh import CausalPhaseRailLayer
 
@@ -176,19 +184,62 @@ class CausalRefreshTests(unittest.TestCase):
                 "show_refresh": True,
                 "auto_refresh": True,
                 "refresh_threshold": 10.0,
+                "refresh_min_age": 0.0,
             })
             frame = np.zeros((h, w, 3), np.float32)
             ctx = FXContext(store, 1.0, 1, (h, w))
             out = effect.apply(frame, ctx)
+            st = ctx.st(effect)
             self.assertEqual(out.shape, frame.shape)
             self.assertEqual(out.dtype, np.float32)
             self.assertTrue(np.isfinite(out).all())
             self.assertGreater(float(out.mean()), 0.01)
+            self.assertIsNotNone(st.get("refresh_reference"))
+            self.assertLess(st["refresh_reading"].structural, 1e-7)
         finally:
-            if old is None:
-                sys.modules.pop("fx_phase_rail", None)
-            else:
-                sys.modules["fx_phase_rail"] = old
+            self._restore_fake_rail(old)
+
+    def test_effect_requests_new_keyframe_after_live_geometry_leaves_anchor(self):
+        """Integration gate for the failure seen on webcam: old style stays frozen."""
+        old = self._with_fake_rail()
+        try:
+            from fx_causal_refresh import CausalPhaseRailLayer
+
+            h, w = 96, 96
+            store = MapStore()
+            store.put("mask", np.ones((h, w), np.float32))
+            person = np.zeros((h, w, 3), np.float32)
+            person[..., 1] = 0.8
+            store.put("person_style", person)
+
+            effect = CausalPhaseRailLayer({
+                "device": "cpu",
+                "rail_size": "64",
+                "show_refresh": False,
+                "auto_refresh": True,
+                "refresh_threshold": 0.03,
+                "refresh_min_age": 0.0,
+                "refresh_decay": 0.95,
+            })
+
+            stable = bars(False, h)
+            moved = bars(True, h)
+            for i in range(16):
+                effect.apply(stable, FXContext(store, float(i), i, (h, w)))
+                self.assertIsNotNone(store.get("person_style"))
+
+            fired = False
+            for i in range(16, 60):
+                effect.apply(moved, FXContext(store, float(i), i, (h, w)))
+                if store.get("person_style") is None:
+                    fired = True
+                    break
+            self.assertTrue(fired)
+            st = store.state[effect.uid]
+            self.assertEqual(st.get("refresh_count"), 1)
+            self.assertTrue(st.get("refresh_pending"))
+        finally:
+            self._restore_fake_rail(old)
 
 
 if __name__ == "__main__":
