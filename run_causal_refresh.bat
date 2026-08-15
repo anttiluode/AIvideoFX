@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python3.13 ai_video_fx_causal.py --preset "Antti Causal Refresh"
+python ai_video_fx_causal.py --preset "Antti Causal Refresh"
 if errorlevel 1 pause
