@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "causal_refresh.py"
+      - "fx_causal_refresh.py"
       - "test_causal_refresh.py"
       - ".github/workflows/causal-refresh-ci.yml"
   pull_request:
     paths:
       - "causal_refresh.py"
+      - "fx_causal_refresh.py"
       - "test_causal_refresh.py"
 
 jobs:
@@ -22,3 +24,14 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install numpy opencv-python-headless
       - run: python -m unittest test_causal_refresh -v
+      - name: Registration smoke test
+        run: |
+          python - <<'PY'
+          import fx_causal_refresh
+          from fx_core import EFFECTS_BY_NAME, PRESETS
+          assert "CausalPhaseRailLayer" in EFFECTS_BY_NAME
+          assert "Antti Causal Refresh" in PRESETS
+          fx = EFFECTS_BY_NAME["CausalPhaseRailLayer"]()
+          assert fx.p("auto_refresh") is True
+          print("causal effect registration PASS")
+          PY
