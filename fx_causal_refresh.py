@@ -67,22 +67,28 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
     def _draw_meter(out: np.ndarray, reading, pending: bool, count: int) -> np.ndarray:
         if reading is None:
             return out
-        h, w = out.shape[:2]
+
+        # OpenCV 5's text renderer requires an 8-bit image.  AIvideoFX's effect
+        # bus is float32 [0,1], so draw the HUD on a temporary uint8 view and
+        # convert back.  The previous code drew directly into float32 and caused
+        # OpenCV 5 to throw, after which Processor disabled the entire effect.
+        hud = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+        h, w = hud.shape[:2]
         x0, y0 = 12, max(8, h - 34)
         width = min(260, max(80, w - 24))
         height = 10
         ratio = float(np.clip(reading.evidence / max(1e-6, reading.threshold), 0.0, 1.0))
-        cv2.rectangle(out, (x0, y0), (x0 + width, y0 + height), (0.05, 0.05, 0.05), -1)
-        cv2.rectangle(out, (x0, y0), (x0 + int(width * ratio), y0 + height), (0.15, 0.95, 0.45), -1)
+        cv2.rectangle(hud, (x0, y0), (x0 + width, y0 + height), (13, 13, 13), -1)
+        cv2.rectangle(hud, (x0, y0), (x0 + int(width * ratio), y0 + height), (38, 242, 115), -1)
         label = (
             f"causal refresh {reading.evidence:.2f}/{reading.threshold:.2f} "
             f"inst {reading.instant:.2f}  {'WAITING' if pending else 'armed'}  n={count}"
         )
-        cv2.putText(out, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (0.02, 0.02, 0.02), 3, cv2.LINE_AA)
-        cv2.putText(out, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (1.0, 1.0, 1.0), 1, cv2.LINE_AA)
-        return out
+        cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (5, 5, 5), 3, cv2.LINE_AA)
+        cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        return hud.astype(np.float32) * np.float32(1.0 / 255.0)
 
     def apply(self, img, ctx):
         mask = ctx.mask()
