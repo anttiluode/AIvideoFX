@@ -6,11 +6,9 @@ changing the shipped AnttisDeepfakeLayer.  Use via::
     python ai_video_fx_causal.py
 
 The effect carries the last generated person with PhaseRail.  A cheap,
-style-tolerant structure residual is accumulated.  When it crosses the chosen
-threshold *and* the keyframe is old enough, the effect asks the already-running
-diffusion worker for a new person keyframe by temporarily clearing the worker's
-``person_style`` slot.  The old keyframe is held locally and remains visible
-until the replacement arrives.
+style-tolerant structure residual is measured continuously.  Each new generated
+keyframe first establishes its own normal mismatch floor; only a later upward
+change from that floor accumulates toward another expensive refresh.
 """
 from __future__ import annotations
 
@@ -33,16 +31,16 @@ from fx_core import (
 class CausalPhaseRailLayer(AnttisDeepfakeLayer):
     name = "Antti Causal Refresh"
     blurb = (
-        "The normal Layered PhaseRail plus an automatic keyframe-spend rule. "
-        "It keeps transporting the frozen generated person while structure is "
-        "still explained; persistent structure mismatch / low PhaseRail confidence "
-        "requests a fresh diffusion person keyframe. The old keyframe remains "
-        "visible while the replacement is generating."
+        "The normal Layered PhaseRail plus a baseline-relative automatic "
+        "keyframe-spend rule. It learns the resting style/transport mismatch of "
+        "each generated person, then refreshes only when mismatch rises above "
+        "that floor persistently. The old keyframe remains visible while the "
+        "replacement is generating."
     )
     params = AnttisDeepfakeLayer.params + [
         Param("auto_refresh", "Auto refresh", "bool", True),
-        Param("refresh_threshold", "Refresh threshold", "float", 0.80, 0.05, 4.0),
-        Param("refresh_decay", "Refresh memory", "float", 0.94, 0.0, 0.995),
+        Param("refresh_threshold", "Change threshold", "float", 0.30, 0.02, 2.0),
+        Param("refresh_decay", "Change memory", "float", 0.94, 0.0, 0.995),
         Param("refresh_min_age", "Min key age (s)", "float", 0.80, 0.0, 10.0),
         Param("show_refresh", "Show refresh meter", "bool", True),
     ]
@@ -68,26 +66,33 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         if reading is None:
             return out
 
-        # OpenCV 5's text renderer requires an 8-bit image.  AIvideoFX's effect
-        # bus is float32 [0,1], so draw the HUD on a temporary uint8 view and
-        # convert back.  The previous code drew directly into float32 and caused
-        # OpenCV 5 to throw, after which Processor disabled the entire effect.
+        # OpenCV 5's text renderer requires an 8-bit image. AIvideoFX's effect
+        # bus is float32 [0,1], so draw the HUD on a temporary uint8 image and
+        # convert back.
         hud = np.clip(out * 255.0, 0, 255).astype(np.uint8)
         h, w = hud.shape[:2]
         x0, y0 = 12, max(8, h - 34)
-        width = min(260, max(80, w - 24))
+        width = min(330, max(80, w - 24))
         height = 10
         ratio = float(np.clip(reading.evidence / max(1e-6, reading.threshold), 0.0, 1.0))
         cv2.rectangle(hud, (x0, y0), (x0 + width, y0 + height), (13, 13, 13), -1)
-        cv2.rectangle(hud, (x0, y0), (x0 + int(width * ratio), y0 + height), (38, 242, 115), -1)
+        colour = (38, 242, 115) if reading.calibrated else (35, 190, 245)
+        cv2.rectangle(hud, (x0, y0), (x0 + int(width * ratio), y0 + height), colour, -1)
+        if pending:
+            state = "WAITING"
+        elif not reading.calibrated:
+            state = "CAL"
+        else:
+            state = "armed"
         label = (
-            f"causal refresh {reading.evidence:.2f}/{reading.threshold:.2f} "
-            f"inst {reading.instant:.2f}  {'WAITING' if pending else 'armed'}  n={count}"
+            f"causal {reading.evidence:.2f}/{reading.threshold:.2f} "
+            f"raw {reading.instant:.2f} base {reading.baseline:.2f} "
+            f"d {reading.excess:+.2f} {state} n={count}"
         )
         cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (5, 5, 5), 3, cv2.LINE_AA)
+                    0.40, (5, 5, 5), 3, cv2.LINE_AA)
         cv2.putText(hud, label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (255, 255, 255), 1, cv2.LINE_AA)
+                    0.40, (255, 255, 255), 1, cv2.LINE_AA)
         return hud.astype(np.float32) * np.float32(1.0 / 255.0)
 
     def apply(self, img, ctx):
@@ -106,7 +111,8 @@ class CausalPhaseRailLayer(AnttisDeepfakeLayer):
         held = st.get("held_person_ai")
         held_stamp = float(st.get("held_person_stamp", -1.0))
         if pending and live_person is not None and live_stamp != held_stamp:
-            # A genuinely new keyframe arrived.
+            # A genuinely new keyframe arrived.  Reset so this keyframe learns
+            # its own resting mismatch floor before it can trigger again.
             pending = False
             st["refresh_pending"] = False
             st["held_person_ai"] = None
@@ -263,7 +269,7 @@ def register() -> None:
                 "mask_expand": 2,
                 "mask_feather": 4.0,
                 "auto_refresh": True,
-                "refresh_threshold": 0.80,
+                "refresh_threshold": 0.30,
                 "refresh_decay": 0.94,
                 "refresh_min_age": 0.80,
                 "show_refresh": True,
