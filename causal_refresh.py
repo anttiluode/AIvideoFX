@@ -1,26 +1,27 @@
-"""Cheap baseline-relative causal-refresh criterion for Layered PhaseRail.
+"""Keyframe-relative causal refresh for the Layered PhaseRail video path.
 
 The expensive person image is generated occasionally and transported cheaply by
-PhaseRail between keyframes.  This module asks one narrow control question:
+PhaseRail between keyframes.  The useful control question is not whether a
+stylised output looks like the webcam -- a marble/robot/etc person never will.
+It is:
 
-    has the transported appearance become *worse than its own normal resting
-    mismatch* with the live person, enough to justify buying another diffusion
-    keyframe?
+    has the live person geometry moved far enough away from the geometry that
+    was accepted when this generated keyframe was anchored that buying another
+    diffusion keyframe is justified?
 
-That distinction matters for stylised video.  A marble/robot/etc keyframe has a
-permanent non-zero mismatch with webcam appearance even when transport is
-working perfectly.  Accumulating the absolute residual therefore creates a
-positive floor and eventually refreshes forever.
+Each fresh generated keyframe therefore gets a *live geometry reference* at the
+moment it is accepted by PhaseRail.  The detector compares the current live
+person with that fixed reference using contrast-normalised blurred edge
+structure inside the ownership mask.  PhaseRail confidence and per-frame motion
+are only small secondary terms.
 
-The primary instantaneous residual is still a contrast-normalised blurred
-edge/structure mismatch inside the person ownership mask, with smaller terms for
-PhaseRail confidence and motion saturation.  The controller now calibrates a
-per-keyframe baseline and runs a one-sided, leaky CUSUM-like change detector on
-excess above that baseline.
+A short per-keyframe warm-up estimates the ordinary segmentation/noise floor and
+a one-sided leaky CUSUM-like detector accumulates only later upward change.  A
+constant non-zero floor cannot mathematically force refreshes forever.
 
-This is a heuristic controller, not a calibrated probability or proof of
-optimality.  Its purpose is testable: stay quiet on a stable non-zero style gap,
-but fire when the mismatch shifts upward after calibration.
+This remains a heuristic controller, not a calibrated probability or proof of
+optimality.  Its purpose is directly testable: remain quiet around one accepted
+pose, then fire when live geometry persistently leaves that pose.
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ def _gray(image: np.ndarray) -> np.ndarray:
 
 
 def _edge_signature(image: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
-    """Low-cost style-tolerant structure signature in [0,1]."""
+    """Low-cost contrast-normalised structure signature in [0,1]."""
     g = _gray(image)
     g = cv2.GaussianBlur(g, (0, 0), 1.25)
     gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
@@ -64,18 +65,20 @@ def _edge_signature(image: np.ndarray, mask: np.ndarray | None = None) -> np.nda
 
 
 def normalized_structure_mismatch(
-    live: np.ndarray,
-    carried: np.ndarray,
+    current: np.ndarray,
+    reference: np.ndarray,
     mask: np.ndarray | None = None,
 ) -> float:
-    """Mean absolute difference between separately contrast-normalised edges."""
-    if live.shape[:2] != carried.shape[:2]:
-        carried = cv2.resize(carried, (live.shape[1], live.shape[0]), interpolation=cv2.INTER_LINEAR)
-    if mask is not None and mask.shape[:2] != live.shape[:2]:
-        mask = cv2.resize(mask, (live.shape[1], live.shape[0]), interpolation=cv2.INTER_LINEAR)
+    """Style/contrast-tolerant structural distance between two live geometries."""
+    if current.shape[:2] != reference.shape[:2]:
+        reference = cv2.resize(
+            reference, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR
+        )
+    if mask is not None and mask.shape[:2] != current.shape[:2]:
+        mask = cv2.resize(mask, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    a = _edge_signature(live, mask)
-    b = _edge_signature(carried, mask)
+    a = _edge_signature(current, mask)
+    b = _edge_signature(reference, mask)
     diff = np.abs(a - b).astype(np.float32)
     if mask is None:
         return float(np.mean(diff))
@@ -88,6 +91,8 @@ def normalized_structure_mismatch(
 
 @dataclass
 class RefreshReading:
+    # ``structural`` is now live geometry drift from the accepted keyframe pose,
+    # not live-vs-generated appearance mismatch.
     structural: float
     confidence_penalty: float
     motion_penalty: float
@@ -101,33 +106,31 @@ class RefreshReading:
 
 
 class CausalRefreshController:
-    """Per-keyframe baseline + one-sided leaky change detector.
+    """Per-keyframe geometry reference + one-sided leaky change detector.
 
-    Calibration deliberately happens after every fresh generated keyframe.  A
-    short warm-up estimates the normal style/transport floor with a median.  The
-    detector then accumulates only positive change above::
+    The effect owns/captures the fixed live reference image.  This controller
+    receives ``current_live`` and ``keyframe_live`` and turns their structural
+    drift into a refresh event.
 
-        baseline * (1 + baseline_margin)
+    A short warm-up estimates residual mask jitter / low PhaseRail confidence.
+    After calibration::
 
-    using::
-
+        excess   = score - baseline * (1 + baseline_margin)
         evidence = max(0, decay * evidence + excess)
 
-    A constant non-zero mismatch therefore settles near zero evidence instead of
-    mathematically guaranteeing a refresh.  While the detector is quiet, the
-    baseline follows very slowly so gradual lighting/style drift can be treated
-    as nuisance rather than as an event.
+    The baseline follows slowly only while evidence is convincingly quiet, so
+    gradual nuisance drift can be ignored without chasing away a real event.
     """
 
     def __init__(
         self,
         *,
         decay: float = 0.94,
-        threshold: float = 0.30,
+        threshold: float = 0.20,
         min_keyframe_age: float = 0.80,
         baseline_alpha: float = 0.02,
-        baseline_margin: float = 0.10,
-        warmup_samples: int = 12,
+        baseline_margin: float = 0.12,
+        warmup_samples: int = 8,
     ) -> None:
         self.decay = float(decay)
         self.threshold = float(threshold)
@@ -152,7 +155,6 @@ class CausalRefreshController:
         self.last = None
 
     def _change_update(self, instant: float) -> tuple[float, float, bool]:
-        """Return baseline, signed excess, calibrated flag for one sample."""
         if len(self._warmup) < self.warmup_samples:
             self._warmup.append(float(instant))
             self.baseline = float(np.median(self._warmup))
@@ -164,9 +166,6 @@ class CausalRefreshController:
         excess = float(instant - baseline_before * (1.0 + self.baseline_margin))
         self.evidence = max(0.0, self.decay * self.evidence + excess)
 
-        # Adapt the nuisance floor only while the detector is convincingly
-        # quiet.  Once a change begins accumulating, freeze the reference so it
-        # cannot chase away the event it is supposed to detect.
         if self.evidence < 0.20 * self.threshold:
             a = float(np.clip(self.baseline_alpha, 0.0, 1.0))
             self.baseline = (1.0 - a) * baseline_before + a * float(instant)
@@ -175,8 +174,8 @@ class CausalRefreshController:
 
     def update(
         self,
-        live: np.ndarray,
-        carried: np.ndarray,
+        current_live: np.ndarray,
+        keyframe_live: np.ndarray,
         *,
         mask: np.ndarray | None = None,
         phase_confidence: float = 1.0,
@@ -184,15 +183,15 @@ class CausalRefreshController:
         max_motion: float = 3.5,
         keyframe_age: float = 0.0,
     ) -> RefreshReading:
-        structural = normalized_structure_mismatch(live, carried, mask)
+        structural = normalized_structure_mismatch(current_live, keyframe_live, mask)
         confidence_penalty = float(np.clip(1.0 - float(phase_confidence), 0.0, 1.0))
         ratio = float(motion) / max(0.25, float(max_motion))
         motion_penalty = float(np.clip((ratio - 0.60) / 0.40, 0.0, 1.0))
 
-        # Structure dominates. Confidence/motion only help identify cases where
-        # the transport solver itself is telling us not to trust its update.
+        # Keyframe-relative geometry is the receiver.  Solver confidence/motion
+        # are only tie-breakers; they must not recreate an absolute style floor.
         instant = float(np.clip(
-            0.72 * structural + 0.20 * confidence_penalty + 0.08 * motion_penalty,
+            0.86 * structural + 0.10 * confidence_penalty + 0.04 * motion_penalty,
             0.0, 1.0,
         ))
 
