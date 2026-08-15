@@ -36,30 +36,104 @@ class CausalRefreshTests(unittest.TestCase):
         m = np.ones(a.shape[:2], np.float32)
         self.assertGreater(normalized_structure_mismatch(a, b, m), 0.05)
 
-    def test_persistent_mismatch_eventually_triggers(self):
+    def test_constant_nonzero_floor_does_not_eventually_trigger(self):
+        """The old absolute accumulator failed this by construction."""
         a = bars(False)
         b = bars(True)
         m = np.ones(a.shape[:2], np.float32)
-        ctrl = CausalRefreshController(decay=0.90, threshold=0.10, min_keyframe_age=0.0)
-        reading = None
-        for _ in range(40):
-            reading = ctrl.update(
-                a, b, mask=m, phase_confidence=1.0,
-                motion=0.0, max_motion=3.5, keyframe_age=10.0,
+        ctrl = CausalRefreshController(
+            decay=0.95, threshold=0.08, min_keyframe_age=0.0,
+            warmup_samples=8,
+        )
+        readings = []
+        for _ in range(160):
+            readings.append(ctrl.update(
+                a, b, mask=m, phase_confidence=0.65,
+                motion=0.3, max_motion=3.5, keyframe_age=30.0,
+            ))
+        self.assertTrue(readings[-1].calibrated)
+        self.assertGreater(readings[-1].baseline, 0.0)
+        self.assertFalse(any(r.triggered for r in readings))
+        self.assertLess(readings[-1].evidence, 0.01)
+
+    def test_later_structural_shift_triggers_relative_detector(self):
+        a = bars(False)
+        b = bars(True)
+        m = np.ones(a.shape[:2], np.float32)
+        ctrl = CausalRefreshController(
+            decay=0.95, threshold=0.08, min_keyframe_age=0.0,
+            warmup_samples=8,
+        )
+
+        # Learn a non-zero nuisance floor first. Lowish confidence simulates a
+        # real styled transport path whose raw score never reaches zero.
+        for _ in range(20):
+            r = ctrl.update(
+                a, a, mask=m, phase_confidence=0.55,
+                motion=0.2, max_motion=3.5, keyframe_age=10.0,
             )
-            if reading.triggered:
+            self.assertFalse(r.triggered)
+        learned = r.baseline
+        self.assertGreater(learned, 0.0)
+
+        triggered = False
+        for _ in range(40):
+            r = ctrl.update(
+                a, b, mask=m, phase_confidence=0.55,
+                motion=0.2, max_motion=3.5, keyframe_age=10.0,
+            )
+            if r.triggered:
+                triggered = True
                 break
-        self.assertIsNotNone(reading)
-        self.assertTrue(reading.triggered)
+        self.assertTrue(triggered)
+        self.assertGreater(r.instant, learned)
+        self.assertGreater(r.excess, 0.0)
 
     def test_keyframe_age_gate_blocks_early_refresh(self):
         a = bars(False)
         b = bars(True)
-        ctrl = CausalRefreshController(decay=0.0, threshold=1e-6, min_keyframe_age=2.0)
-        r = ctrl.update(a, b, keyframe_age=0.5, phase_confidence=0.0, motion=3.5, max_motion=3.5)
+        m = np.ones(a.shape[:2], np.float32)
+        ctrl = CausalRefreshController(
+            decay=0.95, threshold=0.02, min_keyframe_age=2.0,
+            warmup_samples=6,
+        )
+        for _ in range(10):
+            ctrl.update(
+                a, a, mask=m, phase_confidence=0.6,
+                motion=0.0, max_motion=3.5, keyframe_age=0.5,
+            )
+
+        # Build a large change score, but the young-keyframe gate must block it.
+        r = None
+        for _ in range(20):
+            r = ctrl.update(
+                a, b, mask=m, phase_confidence=0.0,
+                motion=3.5, max_motion=3.5, keyframe_age=0.5,
+            )
+        self.assertIsNotNone(r)
+        self.assertGreater(r.evidence, r.threshold)
         self.assertFalse(r.triggered)
-        r = ctrl.update(a, b, keyframe_age=2.5, phase_confidence=0.0, motion=3.5, max_motion=3.5)
+
+        r = ctrl.update(
+            a, b, mask=m, phase_confidence=0.0,
+            motion=3.5, max_motion=3.5, keyframe_age=2.5,
+        )
         self.assertTrue(r.triggered)
+
+    def test_reset_for_new_keyframe_recalibrates(self):
+        a = bars(False)
+        b = bars(True)
+        ctrl = CausalRefreshController(warmup_samples=5)
+        for _ in range(8):
+            r = ctrl.update(a, b, keyframe_age=10.0)
+        self.assertTrue(r.calibrated)
+        self.assertIsNotNone(ctrl.baseline)
+        ctrl.reset()
+        self.assertIsNone(ctrl.baseline)
+        self.assertEqual(ctrl.evidence, 0.0)
+        r = ctrl.update(a, b, keyframe_age=10.0)
+        self.assertFalse(r.calibrated)
+        self.assertFalse(r.triggered)
 
     def test_effect_runs_with_published_person_and_background(self):
         # Exercise the actual CausalPhaseRailLayer plumbing without requiring
