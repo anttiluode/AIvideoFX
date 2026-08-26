@@ -1,0 +1,36 @@
+name: concrete-refresh-ci
+
+on:
+  push:
+    paths:
+      - "causal_refresh_runtime.py"
+      - "fx_concrete_refresh.py"
+      - "ai_video_fx_concrete.py"
+      - "test_concrete_refresh.py"
+      - ".github/workflows/concrete-refresh-ci.yml"
+  pull_request:
+    paths:
+      - "causal_refresh_runtime.py"
+      - "fx_concrete_refresh.py"
+      - "ai_video_fx_concrete.py"
+      - "test_concrete_refresh.py"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_concrete_refresh -v
+      - name: Launcher import smoke test
+        run: |
+          python - <<'PY'
+          import fx_concrete_refresh
+          from fx_core import PRESETS
+          assert "Concrete Dream" in PRESETS
+          print("Concrete Dream registration PASS")
+          PY
