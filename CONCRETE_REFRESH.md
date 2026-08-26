@@ -14,6 +14,20 @@ python3.13 ai_video_fx_concrete.py --preset "Concrete Dream"
 
 The ordinary AI Video FX GUI opens with one extra diffusion effect/preset: **Concrete Dream (adaptive)**.
 
+## Important: which prompt does it use?
+
+Concrete Dream is a **full-frame diffusion mode**. It uses the model, prompt, strength, steps and resolution in the **Diffusion** tab.
+
+It does **not** use the person/background prompts in the **Layers** tab. Those belong to the older layered PhaseRail system.
+
+If you want to prove that diffusion is actually generating an image, select the Concrete Dream effect and set:
+
+```text
+View = keyframe
+```
+
+That shows the latest raw expensive diffusion image directly, with no PhaseRail transport, exposure locking, live-detail rescue or camera blend. `View=split` shows raw keyframe on the left and the carried/output path on the right.
+
 ## What it does
 
 The stock `AI Dream (img2img)` asks the diffusion worker for a live style map at the configured AI rate. Concrete Dream changes only the scheduling contract while it is enabled:
@@ -37,11 +51,16 @@ Removing or disabling Concrete Dream removes its `style_concrete` request token 
 
 ## First controls to touch
 
+- **View**: `keyframe` is the raw generated image; `output` is the transported final result; `split` shows both.
 - **Refresh tolerance**: higher = fewer diffusion calls / more stale-looking risk. Start at `0.12`.
 - **Audit chance**: checked only at the decision rate, not every camera frame. Start at `0.05`.
 - **Between refreshes**: `phase` transports the generated keyframe with PhaseRail; `hold` is the boring attacker.
+- **Live structure**: how much current camera structure PhaseRail injects. The preset now starts at `0.25` so it does not wash away the generated image.
+- **Generated detail**: how much generated high-frequency detail survives transport. The preset starts at `0.95`.
 - **Cold input threshold**: used before enough expensive refreshes exist to learn a sensitivity gain. Lower = more conservative.
 - **Max key age**: hard ceiling that eventually buys a new diffusion image even in a quiet scene.
+
+The preset deliberately starts with `Dream mix=1`, exposure locking off, and no live-detail re-addition so the AI keyframe is visually obvious. Once it works, those can be blended back in.
 
 ## What the HUD means
 
