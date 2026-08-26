@@ -98,6 +98,14 @@ class RegistrationTests(unittest.TestCase):
         fx = EFFECTS_BY_NAME["ConcreteDream"]()
         self.assertIn("style_concrete", fx.requires())
         self.assertTrue(getattr(fx_ai.DiffusionWorker._due, "_concrete_patch", False))
+        view = next(p for p in fx.params if p.key == "view")
+        self.assertIn("keyframe", view.choices)
+
+        preset = PRESETS["Concrete Dream"][0]["values"]
+        self.assertEqual(preset["mix"], 1.0)
+        self.assertFalse(preset["keep_luma"])
+        self.assertLessEqual(preset["rail_structure"], 0.30)
+        self.assertGreaterEqual(preset["rail_detail"], 0.90)
 
 
 if __name__ == "__main__":
